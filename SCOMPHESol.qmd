@@ -1,0 +1,984 @@
+---
+title: BioNutrient Supply Chain Optimization
+author: Just a BI student
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-summary: Show Code
+    self-contained: true
+jupyter: python3
+---
+
+```{python}
+#| tags: [remove-cell]
+import amplpy
+from amplpy import AMPL, add_to_path
+
+add_to_path(r"/home/kamil/Documents/UNI/MS2/SCOMP/ampl.linux-intel64")
+ampl = AMPL()
+```
+
+I recommend viewing this as an html in Your webbrowser for the best experience. PDF is a stillshot of the html.
+
+Assumptions:
+Since no initial stock is provided I assume it is 0.  
+The official AMPL style guide will be used.I will add an underscore to constraints to make them easier to differentiate.
+
+# Sets
+
+```{python}
+ampl.eval("""
+reset;
+# SETS
+
+set Q;                      #Quarters
+set P;                      #Production plants
+set D;                      #Districts
+set B;                      #Boats
+set R;                      #Routes
+set W;                      #Warehouses
+# Leg-level refined sets
+set L;                      #Legs
+# Subsets for logic gating
+set BH within B;            #Boats eligible for partial rental (Anna, Emma)
+set RC within R;            #Routes that visit the central warehouse
+""")
+```
+
+# Parameters
+
+```{python}
+ampl.eval("""
+# PARAMETERS
+
+# Time and Demand
+param days {Q};
+param demand {D, Q};                #Q5&9
+
+# Production Facts
+param prod_cap {P};                 # Q2 & 3
+param rm_cost {P};                  # Q2, 3 & 10
+param shift_fixed := 4000000;       # Q10
+param ot4 := 1500000;               # Q10
+param ot5 := 3000000;               # Q10
+
+# Production Limits
+param min_shifts := 3;              # Q2 & 3
+param max_shifts := 5;              # Q2 & 3
+
+# Warehouse Facts
+param storage_cap {W};              # Q6
+param handling_cap {W};
+param hold_cost := 50;              # Q6 & 10
+param central_rent := 7000000;      # Q1
+
+# Boat and Route Facts
+param boat_load {B};
+param boat_yearly_cost {B};         # Q7, 8 & 10
+param route_time {R};
+param route_legs {R};
+param penalty := 12000;             # Q10
+
+# Unique set defined by the parameter
+set LEGS {r in R} = 1..route_legs[r];          #Defines legs specific to each route
+
+# Logistic Mapping
+param visits {r in R, l in LEGS[r], d in D} binary, default 0;         # 1 if district d is visited during leg l of route r
+# Leg-level location mappings
+param orig {r in R, l in LEGS[r]} symbolic in W; # Starting warehouse for each leg
+param dest {r in R, l in LEGS[r]} symbolic in W; # Ending warehouse for each leg
+
+# Partial Rental Logic
+param anna_q2q3 := 12000000;        # Q7 & 8
+param emma_q2q3 := 9400000;         # Q7 & 
+
+# Initial state
+param initial_storage {W} default 0;
+param big_m := 1000000;
+""")
+```
+
+# Decision Variables
+
+```{python}
+ampl.eval("""
+# DECISION VARIABLES
+
+# Warehouse Decisions
+var RentCentral binary;                 # Q1: 1 if we rent the central warehouse, 0 otherwise
+var Store {W, 0..4} >= 0;               # Q6: Tons stored at end of quarter (0 is initial)
+
+# Production Decisions
+var Produced {P, Q} >= 0;               # Q3: Total tons manufactured at each plant
+var Shifts {P, Q} integer >= 3, <= 5;   # Q2: Number of shifts (must be 3, 4, or 5)
+var UseShift4 {P, Q} binary;            # Q10: Trigger for the NOK 1.5m overtime cost
+var UseShift5 {P, Q} binary;            # Q10: Trigger for the NOK 3.0m overtime cost
+
+# Logistics Decisions
+var HireFull {B} binary;                # Q7: 1 if we hire the boat for the whole year
+var HirePartial {B} binary;             # Q7: 1 if we hire Anna/Emma for Q2+Q3 only
+var Assign {B, R, Q} binary;            # Q8: 1 if Boat B follows Route R in Quarter Q
+
+# Leg flow
+var DistrictSupply {b in B, r in R, l in LEGS[r], d in D, q in Q} >= 0;     # Tons delivered by boat b, on route r, during leg l, to district d, in quarter q
+var WarehouseTransfer {b in B, r in R, l in LEGS[r], q in Q} >= 0;          # Tons transferred by boat b, on route r, during leg l, to destination warehouse in quarter q
+
+# Customer Service Decisions
+var Shortfall {D, Q} >= 0;              # Q10: Tons not delivered (incurs NOK 12,000 penalty)
+""")
+```
+
+# Constraints
+
+```{python}
+ampl.eval("""
+# CONSTRAINTS
+
+# Demand
+s.t. Demand_Satisfaction {d in D, q in Q}:
+    # Total amount of tons delivered to a district from all boats on all serving routes on all legs
+    sum {b in B, r in R, l in LEGS[r]: visits[r, l, d]} DistrictSupply[b, r, l, d, q] + Shortfall[d, q] = demand[d, q];
+
+# Production
+s.t. Production_Limit {p in P, q in Q}:
+    Produced[p, q] <= Shifts[p, q] * prod_cap[p];
+
+# Binary triggers for overtime costs (to answer Question 10)
+s.t. Trigger_OT4 {p in P, q in Q}:
+    Shifts[p, q] <= 3 + 2 * UseShift4[p, q];
+
+s.t. Trigger_OT5 {p in P, q in Q}:
+    Shifts[p, q] <= 4 + 1 * UseShift5[p, q];
+
+# Storage
+
+# Set the starting feed levels (usually 0 per the exam)
+s.t. Initial_Stock_Rule {w in W}:
+    Store[w, 0] = initial_storage[w];
+
+s.t. Warehouse_Balance {w in W, q in Q}:
+    Store[w, q-1]                       # Stock from last quarter
+    + (if w in P then Produced[w, q] else 0) # Production (only at plants)
+    + sum {b in B, r in R, l in LEGS[r]: dest[r, l] == w and orig[r, l] != w} WarehouseTransfer[b, r, l, q] # Inbound
+    = 
+    Store[w, q]                         # Current storage
+    + sum {b in B, r in R, l in LEGS[r]: orig[r, l] == w} (
+        sum {d in D} DistrictSupply[b, r, l, d, q] # Deliveries starting at w
+        + (if dest[r, l] != w then WarehouseTransfer[b, r, l, q] else 0) # Outbound Transfers
+    );
+
+s.t. Silo_Limit {w in W, q in Q}:
+    Store[w, q] <= (if w == "Central" then storage_cap[w] * RentCentral else storage_cap[w]);
+
+s.t. Central_Warehouse_Gating {b in B, r in RC, q in Q}:
+    Assign[b, r, q] <= RentCentral; # Routes in RC (1,2,5,6,9) only if rented [3]
+
+# Handling
+s.t. Handling_Limit {w in W, q in Q}:
+    sum {b in B, r in R, l in LEGS[r]: orig[r, l] == w} (sum {d in D} DistrictSupply[b, r, l, d, q] + WarehouseTransfer[b, r, l, q]) # Loading
+    + sum {b in B, r in R, l in LEGS[r]: dest[r, l] == w and orig[r, l] != w} WarehouseTransfer[b, r, l, q] # Discharging
+    <= handling_cap[w];
+
+# Leg-Based Capacity (Physically accurate tracking)
+s.t. Leg_Capacity {b in B, r in R, l in LEGS[r], q in Q}:
+    sum {d in D} DistrictSupply[b, r, l, d, q] + WarehouseTransfer[b, r, l, q] 
+    <= boat_load[b] * (days[q] / route_time[r]) * Assign[b, r, q];
+
+# Logistics
+
+# One boat per route, one route per boat
+s.t. One_Boat_Per_Route {r in R, q in Q}:
+    sum {b in B} Assign[b, r, q] <= 1;
+
+s.t. One_Route_Per_Boat {b in B, q in Q}:
+    sum {r in R} Assign[b, r, q] <= 1;
+
+# Link assignments to hiring decisions (Question 7)
+s.t. Hiring_Requirement {b in B, q in Q}:
+    sum {r in R} Assign[b, r, q] <= 
+        (HireFull[b] + if (b == "Anna" or b == "Emma") and q in {2,3} then HirePartial[b] else 0);
+
+# Ensure the solver only picks ONE hiring contract per boat
+s.t. Exclusive_Hire {b in B}:
+    HireFull[b] + (if (b == "Anna" or b == "Emma") then HirePartial[b] else 0) <= 1;
+""")
+```
+
+# Objective Function
+
+```{python}
+ampl.eval("""
+# Objective Function
+minimize Total_Yearly_Cost:
+    # 1. Raw Material Costs (1,800 NOK or 2,000 NOK per ton)
+    sum {p in P, q in Q} (rm_cost[p] * Produced[p, q] )
+
+    # 2. Fixed Production Costs (NOK 4m per shift)
+    + sum {p in P, q in Q} (shift_fixed * Shifts[p, q])
+
+    # 3. Overtime Costs (NOK 1.5m for 4th shift, 3.0m for 5th)
+    + sum {p in P, q in Q} (ot4 * UseShift4[p, q] + ot5 * UseShift5[p, q])
+
+    # 4. Storage Costs (NOK 50 per ton)
+    + sum {w in W, q in Q} (hold_cost * Store[w, q])
+
+    # 5. Warehouse Rent (NOK 7m if used)
+    + (central_rent * RentCentral)
+
+    # 6. Boat Hire Costs (Yearly or Partial)
+    + sum {b in B} (boat_yearly_cost[b] * HireFull[b])
+    + (anna_q2q3 * HirePartial["Anna"]) + (emma_q2q3 * HirePartial["Emma"])
+
+    # 7. Penalty for Unmet Demand (NOK 12,000 per ton)
+    + sum {d in D, q in Q} (penalty * Shortfall[d, q]);
+""")
+```
+
+# Data
+
+```{python}
+ampl.set["Q"] = [1, 2, 3, 4]
+ampl.set["D"] = [f"D{i}" for i in range(1, 6)]
+ampl.set["P"] = ["North", "South"]
+ampl.set["W"] = ["North", "South", "Central"]
+ampl.set["B"] = ["Anna", "Belinda", "Carla", "Diana", "Emma", "Fiona", "Gunda", "Huldra"]
+ampl.set["R"] = [f"R{i}" for i in range(1, 10)]
+ampl.set["BH"] = ["Anna", "Emma"]
+ampl.set["RC"] = ["R1", "R2", "R5", "R6", "R9"]
+ampl.set["L"] = [1, 2, 3, 4]
+```
+
+```{python}
+import pandas as pd
+
+# Demand data
+demand_data = {
+    1: [4000, 3000, 7000, 10000, 15000],
+    2: [19000, 15000, 24000, 24000, 38000],
+    3: [34000, 21000, 33000, 36000, 48000],
+    4: [15000, 14000, 25000, 17000, 27000]
+}
+df_demand = pd.DataFrame(demand_data, index=["D1", "D2", "D3", "D4", "D5"])
+# Send the whole DataFrame to AMPL
+ampl.param["demand"] = df_demand.stack() # .stack() converts it to the 2D index D, Q
+# Number of days per quarter as specified in the exam table [1]
+ampl.param["days"] = {1: 90, 2: 91, 3: 92, 4: 92}
+# Production Capacity and Raw Material Costs 
+ampl.param["prod_cap"] = {"North": 17000, "South": 15000}
+ampl.param["rm_cost"]  = {"North": 1800, "South": 2000}
+# Warehouse Storage and Handling Capacities 
+ampl.param["storage_cap"]  = {"North": 8000, "Central": 16000, "South": 9500}
+ampl.param["handling_cap"] = {"North": 90000, "Central": 60000, "South": 88000}
+# Route Duration and Legs 
+ampl.param["route_time"] = {"R1": 16, "R2": 12, "R3": 6, "R4": 4, "R5": 4, "R6": 6, "R7": 5, "R8": 12, "R9": 8}
+ampl.param["route_legs"] = {"R1": 4, "R2": 4, "R3": 2, "R4": 2, "R5": 2, "R6": 2, "R7": 2, "R8": 2, "R9": 4}
+
+
+
+# Boat data
+boat_data = {
+    "load": [1800, 1700, 1600, 1400, 1200, 1100, 1000, 900],
+    "cost": [16000000, 15400000, 14800000, 13800000, 12000000, 11600000, 10800000, 10400000]
+}
+df_boats = pd.DataFrame(boat_data, index=["Anna", "Belinda", "Carla", "Diana", "Emma", "Fiona", "Gunda", "Huldra"])
+
+
+# Assigning to the snake_case parameters [7]
+ampl.param["boat_load"] = df_boats["load"]
+ampl.param["boat_yearly_cost"] = df_boats["cost"]
+
+# Logistic data
+# Mapping visits {r in R, l in LEGS[r], d inD} 
+visits_map = {
+    # Route 1: 4 legs
+    ("R1", 1, "D1"): 1, ("R1", 1, "D2"): 1, ("R1", 1, "D3"): 1,
+    ("R1", 2, "D3"): 1, ("R1", 2, "D4"): 1, ("R1", 2, "D5"): 1,
+    ("R1", 3, "D5"): 1, ("R1", 3, "D4"): 1, ("R1", 3, "D3"): 1,
+    ("R1", 4, "D3"): 1, ("R1", 4, "D2"): 1, ("R1", 4, "D1"): 1,
+    # Route 2: 4 legs
+    ("R2", 1, "D2"): 1, ("R2", 2, "D4"): 1, ("R2", 3, "D4"): 1, 
+    ("R2", 4, "D2"): 1,
+    # Route 3: 2 legs
+    ("R3", 1, "D1"): 1, ("R3", 2, "D2"): 1, ("R3", 2, "D1"): 1,
+    # Route 4: 2 legs (Northern focus)
+    ("R4", 1, "D1"): 1, ("R4", 2, "D1"): 1,
+    # Route 5: 2 legs (Central focus)
+    ("R5", 1, "D3"): 1, ("R5", 2, "D3"): 1,
+    # Route 6: 2 legs (Central focus)
+    ("R6", 1, "D3"): 1, ("R6", 1, "D4"): 1, ("R6", 2, "D3"): 1, 
+    ("R6", 2, "D2"): 1,
+    # Route 7: 2 legs (Southern focus)
+    ("R7", 1, "D5"): 1, ("R7", 2, "D5"): 1,
+    # Route 8: 2 legs (The only direct North-South route for these districts)
+    ("R8", 1, "D2"): 1, ("R8", 1, "D3"): 1, ("R8", 1, "D4"): 1,
+    ("R8", 2, "D4"): 1, ("R8", 2, "D3"): 1, ("R8", 2, "D2"): 1,
+    # Route 9: 4 legs (Warehouse transfers ONLY, no districts)
+
+}
+ampl.param["visits"] = visits_map
+
+# Mapping Origin and Destination 
+orig_map = {
+    # Route 1: N -> C -> S -> C -> N (16 days)
+    ("R1", 1): "North", ("R1", 2): "Central", ("R1", 3): "South", 
+    ("R1", 4): "Central",
+    
+    # Route 2: N -> C -> S -> C -> N (12 days)
+    ("R2", 1): "North", ("R2", 2): "Central", ("R2", 3): "South", (
+        "R2", 4): "Central",
+    
+    # Route 3: N -> N (6 days)
+    ("R3", 1): "North", ("R3", 2): "North",
+    
+    # Route 4: N -> N (4 days)
+    ("R4", 1): "North", ("R4", 2): "North",
+    
+    # Route 5: C -> C (4 days)
+    ("R5", 1): "Central", ("R5", 2): "Central",
+    
+    # Route 6: C -> C (6 days)
+    ("R6", 1): "Central", ("R6", 2): "Central",
+    
+    # Route 7: S -> S (5 days)
+    ("R7", 1): "South", ("R7", 2): "South",
+    
+    # Route 8: N -> S -> N (12 days)
+    ("R8", 1): "North", ("R8", 2): "South",
+    
+    # Route 9: N -> C -> S -> C -> N (8 days)
+    ("R9", 1): "North", ("R9", 2): "Central", ("R9", 3): "South", 
+    ("R9", 4): "Central"
+
+}
+ampl.param["orig"] = orig_map
+
+dest_map = {
+    # Route 1: North -> Central -> South -> Central -> North
+    ("R1", 1): "Central", ("R1", 2): "South", ("R1", 3): "Central", ("R1", 4): "North",
+    
+    # Route 2: North -> Central -> South -> Central -> North
+    ("R2", 1): "Central", ("R2", 2): "South", ("R2", 3): "Central", ("R2", 4): "North",
+    
+    # Route 3: North -> North
+    ("R3", 1): "North", ("R3", 2): "North",
+    
+    # Route 4: North -> North
+    ("R4", 1): "North", ("R4", 2): "North",
+    
+    # Route 5: Central -> Central
+    ("R5", 1): "Central", ("R5", 2): "Central",
+    
+    # Route 6: Central -> Central
+    ("R6", 1): "Central", ("R6", 2): "Central",
+    
+    # Route 7: South -> South
+    ("R7", 1): "South", ("R7", 2): "South",
+    
+    # Route 8: North -> South -> North
+    ("R8", 1): "South", ("R8", 2): "North",
+    
+    # Route 9: North -> Central -> South -> Central -> North
+    ("R9", 1): "Central", ("R9", 2): "South", ("R9", 3): "Central", ("R9", 4): "North"
+}
+
+ampl.param["dest"] = dest_map
+```
+
+```{python}
+ampl.setOption("solver", "highs")
+ampl.solve()
+```
+
+Checking values
+
+```{python}
+assert ampl.solve_result == "solved"
+# This makes sure the result isn't "infeasible", meaning the constraints were impossible to meet.
+```
+
+# Answers
+
+## Question 1: Should the company rent the central warehouse?
+
+```{python}
+rent_decision = ampl.get_variable("RentCentral").value()
+
+if rent_decision > 0.5:
+    print("Answer 1: Yes, the company should rent the central warehouse (Cost: NOK 7,000,000).") 
+else:
+    print("Answer 1: No, the company should NOT rent the central warehouse.") 
+print("-" * 99)
+```
+
+## Question 2: How many shifts should be run at each plant per quarter?
+
+```{python}
+df_shifts = ampl.get_data("Shifts").to_pandas().unstack(level=1)
+df_shifts.columns = ["Q1", "Q2", "Q3", "Q4"]
+
+print("\nAnswer 2: Quarterly Shift Plan (Min 3, Max 5 shifts):") 
+print("-" * 99)
+print(df_shifts.astype(int)) # Shifts must be whole numbers 
+```
+
+## Question 3: How much should be produced at each plant per quarter?
+
+```{python}
+df_produced = ampl.get_data("Produced").to_pandas().unstack(level=1)
+df_produced.columns = ["Q1", "Q2", "Q3", "Q4"]
+
+print("\nAnswer 3: Quarterly Production Volume (Tons):") 
+print("-" * 99)
+print(df_produced.round(0)) # Rounding for professional presentation
+```
+
+## Question 4: How much should be transported between warehouses?
+
+```{python}
+df_transfer = ampl.get_variable("WarehouseTransfer").get_values().to_pandas()
+df_transfer.index.names = ['Boat', 'Route', 'Leg', 'Quarter']
+
+df_full_list = df_transfer[df_transfer['WarehouseTransfer.val'] > 0.1]
+
+# Use .to_string() to force pandas to show EVERY row
+print("Answer 4: Full List of Inter-Warehouse Transfers (Tons):")
+print("-" * 99)
+print(df_full_list.to_string())
+```
+
+## Question 5: How much should be transported from each warehouse to each sales district in each quarter?
+
+```{python}
+df_supply = ampl.get_variable("DistrictSupply").get_values().to_pandas().reset_index()
+
+# The rest of your index mapping is correct for the 5-index leg-level structure
+# Indices: Boat (0), Route (1), Leg (2), District (3), Quarter (4)
+df_supply.columns = ['B', 'R', 'L', 'D', 'Q', 'Tons']
+
+# Map (Route, Leg) to the starting Warehouse using your 'orig' parameter
+orig_map = ampl.get_parameter("orig").get_values().to_dict()
+df_supply['W'] = df_supply.set_index(['R', 'L']).index.map(orig_map)
+
+# Now group by Warehouse, District, and Quarter
+df_supply_total = df_supply.groupby(['W', 'D', 'Q'])['Tons'].sum().unstack(level='Q')
+
+print("Answer 5: Quarterly Shipments to Sales Districts (Tons):")
+print("-" * 99)
+print(df_supply_total.fillna(0).round(0))
+```
+
+## Question 6: How much should be stored at each of the warehouses by the end of each quarter?
+
+```{python}
+df_store_final = ampl.get_variable("Store").get_values().to_pandas().unstack(level=1)
+
+df_store_quarters = df_store_final.iloc[:, :]
+
+# 4. Rename for the presentation
+df_store_quarters.columns = ["Initial", "Q1", "Q2", "Q3", "Q4"]
+
+print("\nAnswer 6: End-of-Quarter Storage Levels (Tons):")
+print("-" * 99)
+display(df_store_quarters.round(0))
+```
+
+## Question 7: Which boats should be used in the transportation?
+
+```{python}
+# Get the values for both full-year and partial-year rentals
+full_rentals = ampl.get_variable("HireFull").get_values().to_pandas()
+partial_rentals = ampl.get_variable("HirePartial").get_values().to_pandas()
+
+print("Answer 7: Boat Hiring Decisions")
+print("-" * 99)
+
+# Identify and print boats hired for the Full Year
+for boat, row in full_rentals.iterrows():
+    if row.iloc[0] > 0.5: 
+        print(f"- {boat}: Full Year Rental")
+
+# Identify and print boats hired for Q2+Q3 only
+for boat, row in partial_rentals.iterrows():
+    if row.iloc[0] > 0.5:
+        print(f"- {boat}: Q2+Q3 Rental Only")
+```
+
+## Question 8: Which route should each boat follow in each quarter?
+
+```{python}
+# Get the Assign variable values as a DataFrame
+assign_df = ampl.get_variable("Assign").get_values().to_pandas()
+
+# Filter for only the active assignments (where the value is 1)
+active_routes = assign_df[assign_df.iloc[:, 0] > 0.5]
+
+print("Answer 8: Boat-to-Route Assignments per Quarter")
+print("-" * 99)
+
+# Create a mapping for pretty printing
+q_map = {1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4"}
+
+# Iterate through the actual integer values used in your AMPL set
+for q_val in [1, 2, 3, 4]:
+    print(f"\n--- {q_map[q_val]} ---")
+    
+    # Filter assignments for the specific quarter (integer 1, 2, 3, or 4)
+    q_assignments = active_routes[active_routes.index.get_level_values(2) == q_val]
+    
+    if q_assignments.empty:
+        print("  No boats assigned.")
+    else:
+        # Unpack the index levels: Boat, Route, Quarter
+        for (boat, route, q), val in q_assignments.iterrows():
+            print(f"  - {boat:8} is following Route {route}")
+```
+
+## Question 9: How much should be supplied by each boat to each sales district and to each warehouse each quarter?
+
+```{python}
+# 1. Get values for both supply variables
+dist_df = ampl.get_variable("DistrictSupply").get_values().to_pandas()
+wh_df = ampl.get_variable("WarehouseTransfer").get_values().to_pandas()
+
+# 2. Standardize column names for merging
+dist_df.columns = ['Tons']
+wh_df.columns = ['Tons']
+
+# 3. Process District Deliveries
+# Index levels: Boat, Route, Leg, District, Quarter
+dist_flat = dist_df.reset_index()
+dist_summary = dist_flat[dist_flat['Tons'] > 0.1].copy()
+dist_summary = dist_summary.rename(columns={'index3': 'Destination'})
+
+# 4. Process Warehouse Transfers
+# Index levels: Boat, Route, Leg, Quarter
+# We need to map (Route, Leg) to the 'dest' warehouse parameter
+dest_map = ampl.get_parameter("dest").get_values().to_dict()
+wh_flat = wh_df.reset_index()
+wh_summary = wh_flat[wh_flat['Tons'] > 0.1].copy()
+wh_summary['Destination'] = wh_summary.set_index(['index1', 'index2']).index.map(dest_map)
+wh_summary = wh_summary.rename(columns={'index3': 'index4'}) # Align Quarter index
+
+# 5. Combine and Print
+combined = pd.concat([
+    dist_summary[['index0', 'Destination', 'index4', 'Tons']],
+    wh_summary[['index0', 'Destination', 'index4', 'Tons']]
+])
+combined.columns = ['Boat', 'Destination', 'Quarter', 'Tons']
+
+print("Answer 9: Detailed Supply per Boat (Tons)")
+print("-" * 99)
+output = combined.groupby(['Quarter', 'Boat', 'Destination'])['Tons'].sum().unstack(level=0).fillna(0)
+display(output.round(0))
+```
+
+## Question 10: What will be the total yearly costs for your plan? Specify the individual cost components (raw material costs, production capacity costs, etc...)
+
+```{python}
+# 1. Total Objective Value
+total_cost = ampl.get_objective("Total_Yearly_Cost").value()
+
+# Helper function to get single values from AMPL expressions safely
+def get_ampl_val(query):
+    # Convert to pandas, then grab the first value found
+    return ampl.get_data(query).to_pandas().iloc[0,0]
+
+# 2. Raw Material Costs
+rm_costs = get_ampl_val('sum {p in P, q in Q} (rm_cost[p] * Produced[p, q])')
+
+# 3. Fixed Production Costs
+fixed_prod = get_ampl_val('sum {p in P, q in Q} (shift_fixed * Shifts[p, q])')
+
+# 4. Overtime Costs
+ot_costs = get_ampl_val('sum {p in P, q in Q} (ot4 * UseShift4[p, q] + ot5 * UseShift5[p, q])')
+
+# 5. Storage Costs
+storage_costs = get_ampl_val('sum {w in W, q in Q} (hold_cost * Store[w, q])')
+
+# 6. Warehouse Rent
+rent_cost = ampl.get_variable("RentCentral").value() * 7000000
+
+# 7. Boat Rental Costs
+boat_full = get_ampl_val('sum {b in B} (boat_yearly_cost[b] * HireFull[b])')
+
+# Calculate partial boat costs (Anna and Emma)
+anna_p = ampl.get_variable("HirePartial").get("Anna").value() * 12000000
+emma_p = ampl.get_variable("HirePartial").get("Emma").value() * 9400000
+total_boat_costs = boat_full + anna_p + emma_p
+
+# 8. Penalties
+penalties = get_ampl_val('sum {d in D, q in Q} (penalty * Shortfall[d, q])')
+
+print("Master Cost Breakdown")
+print("-" * 99)
+print(f"{'Category':<25} {'Cost (NOK)':>14}")
+print("-" * 99)
+print(f"{'Raw Material Costs:':<25} {rm_costs:14,.0f}")
+print(f"{'Fixed Production:':<25} {fixed_prod:14,.0f}")
+print(f"{'Overtime Costs:':<25} {ot_costs:14,.0f}")
+print(f"{'Storage Holding:':<25} {storage_costs:14,.0f}")
+print(f"{'Warehouse Rent:':<25} {rent_cost:14,.0f}")
+print(f"{'Boat Rental:':<25} {total_boat_costs:14,.0f}")
+print(f"{'Shortfall Penalties:':<25} {penalties:14,.0f}")
+print("-" * 99)
+print(f"{'TOTAL YEARLY COST:':<25} {total_cost:14,.0f}")
+```
+
+## Question 11: Imagine that your plan is rejected because it does not consider the uncertainty that will be present in a practical situation and its impact on customer service. What types of uncertainty could that be? How would you deal with this, that is, how would you take into account uncertainty and customer service?
+
+### Types of Uncertainty
+A deterministic optimization model assumes all input parameters are fixed and known. In a real-world maritime supply chain, several variables introduce uncertainty that can lead to significant cost variances:
+
+1. Demand Volatility: Customer demand in the five districts is rarely static. Weather conditions or market shifts can cause spikes in Q2 or Q3. If demand exceeds the forecast even slightly, the model may incur massive Shortfall Penalties (12,000 NOK/ton) because the fleet capacity is already optimized to the limit.
+
+2. Operational and Lead-Time Risks: The model assumes fixed travel times (e.g., 16 days for Route 1). In reality, North Sea storms, port congestion, or mechanical breakdowns can delay a boat. A 10-day delay for a vessel like Anna during the peak season could result in empty shelves at a sales district.
+
+3. Production Uncertainty: Mechanical failures at the North or South plants could reduce the weekly output. Since the current plan minimizes inventory to save on holding costs, there is no "buffer" to protect against a production halt.
+
+### Dealing with Uncertainty and Customer Service
+To address these rejections, I would move from a "Minimum Cost" strategy to a "Robustness" strategy. This involves the following steps:
+
+1. Building Physical Buffers (Safety Stock)
+The current model often targets zero inventory at the end of periods to save on the 50 NOK/ton holding cost. To prioritize customer service, I would add a Safety Stock Constraint, requiring each warehouse to maintain a minimum inventory level (e.g., 15% of the next quarter's expected demand). This acts as an insurance policy against lead-time delays or demand spikes.
+
+2. Increasing the Penalty Weight (Service Level Focus)
+If customer service is the priority, the "Shortfall Penalty" should be set high enough to ensure the solver treats it as a "hard" constraint. By increasing the penalty significantly above the cost of hiring an additional boat (like Carla), the model is forced to hire extra capacity "just in case" rather than risking a stock-out.
+
+3. Implementing Stochastic Programming
+Instead of solving for one set of numbers, I would use Scenario-Based Optimization. This involves testing the plan against "Best Case," "Worst Case," and "Most Likely" demand scenarios simultaneously. This allows the model to identify "first-stage" decisions (like which boats to hire for the full year) that perform well across all possible futures, rather than a plan that only works if everything goes perfectly.
+
+4. The Information Trade-off
+I would argue that better data and predictive analytics can substitute for expensive physical assets. By improving demand forecasting, we can "pre-position" inventory in the Central warehouse during the quieter Q1/Q2 periods. This uses the cheaper storage capacity to mitigate the risk of needing an expensive emergency boat hire during the Q3 peak.
+
+### Summary:
+Uncertainty creates a Cost Variance. A plan that is "optimal" on paper may become the most expensive option if it is too fragile to handle a storm or a demand spike. By incorporating safety stocks and scenario testing, we ensure that the total yearly cost remains stable and customer service is guaranteed, even when reality deviates from the forecast.
+
+# Visualization
+This is a section I am making as a bonus to show the coolness of this submission format
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to expand the plot code
+import plotly.graph_objects as go
+import plotly.io as pio
+pio.renderers.default = "notebook_connected"
+
+# 1. Prepare the data
+# We ensure the index is named 'P' (from your set) and then move it to a column
+df_plot = df_shifts.copy()
+df_plot.index.name = 'P' 
+df_plot = df_plot.reset_index()
+
+# 2. Define colors: Blue for standard (3 shifts), Red for Overtime (4-5)
+fig = go.Figure()
+
+# 3. Add traces for each plant using the correct column name 'P'
+for plant in df_plot['P']:
+    # Select the row for this plant and exclude the 'P' column for the Y-axis data
+    plant_row = df_plot[df_plot['P'] == plant].iloc[0, 1:]
+    
+    fig.add_trace(go.Bar(
+        x=["Q1", "Q2", "Q3", "Q4"],
+        y=plant_row,
+        name=plant,
+        text=plant_row,
+        textposition='auto',
+        marker_color=['#3498db' if val <= 3 else '#e74c3c' for val in plant_row],
+        hovertemplate="<b>%{x}</b><br>" +
+                      "Plant: " + str(plant) + "<br>" +
+                      "Shifts: %{y}<br>" +
+                      "<extra></extra>"
+    ))
+
+# 4. Styling (Same as before)
+fig.update_layout(
+    title="Quarterly Production Shifts: Overtime Detection",
+    xaxis_title="Quarter",
+    yaxis_title="Number of Shifts",
+    yaxis=dict(tickmode='linear', tick0=0, dtick=1, range=[0, 5.5]),
+    barmode='group',
+    template="plotly_white",
+    legend_title="Production Site"
+)
+
+fig.show()
+```
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to see Plotly code for Warehouse Transfers
+
+import plotly.express as px
+
+# 1. Prepare the data from your existing df_full_list
+df_plot_transfer = df_full_list.reset_index()
+# Rename the value column for a cleaner legend
+df_plot_transfer = df_plot_transfer.rename(columns={'WarehouseTransfer.val': 'Tons'})
+
+# 2. Create an Interactive Stacked Bar Chart
+fig = px.bar(
+    df_plot_transfer, 
+    x="Quarter", 
+    y="Tons", 
+    color="Boat",
+    title="Strategic Inter-Warehouse Transfers by Boat",
+    labels={"Tons": "Volume (Tons)", "Quarter": "Time Period"},
+    hover_data=["Route", "Leg"], # Shows which route was used when hovering
+    text_auto='.2s',             # Adds shorthand labels (e.g., 15k) on the bars
+    template="plotly_white"
+)
+
+# 3. Refine the layout
+fig.update_layout(
+    barmode='stack',
+    xaxis={'categoryorder':'array', 'categoryarray':['Q1', 'Q2', 'Q3', 'Q4']},
+    legend_title_text='Vessel Name'
+)
+
+# 4. Add an annotation explaining the strategy
+fig.add_annotation(
+    x="Q2", 
+    y=df_plot_transfer[df_plot_transfer['Quarter']=='Q2']['Tons'].sum(),
+    text="Strategic Stockpiling",
+    showarrow=True,
+    arrowhead=2,
+    ax=0,
+    ay=-40  # This moves the text 40 pixels ABOVE the point
+)
+
+fig.show()
+```
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to see Sankey Flow Diagram code
+
+# 1. Prepare long-form data
+df_sankey = df_supply.groupby(['W', 'D', 'Q'])['Tons'].sum().reset_index()
+
+# 2. Create unique labels for nodes
+nodes = list(pd.unique(df_sankey[['W', 'D']].values.ravel('K')))
+node_dict = {name: i for i, name in enumerate(nodes)}
+
+# 3. Map sources and targets
+df_sankey['source'] = df_sankey['W'].map(node_dict)
+df_sankey['target'] = df_sankey['D'].map(node_dict)
+
+# 4. Robust Color Mapping (prevents the ValueError)
+# We convert Q to string and strip spaces just in case
+color_map = {
+    'Q1': 'rgba(31, 119, 180, 0.4)', 
+    'Q2': 'rgba(255, 127, 14, 0.4)', 
+    'Q3': 'rgba(44, 160, 44, 0.4)', 
+    'Q4': 'rgba(214, 39, 40, 0.4)'
+}
+# Map colors and fill any missing ones with a light grey
+link_colors = df_sankey['Q'].astype(str).str.strip().map(color_map).fillna('rgba(200, 200, 200, 0.4)')
+
+# 5. Create the figure
+fig = go.Figure(data=[go.Sankey(
+    node = dict(
+      pad = 15,
+      thickness = 20,
+      line = dict(color = "black", width = 0.5),
+      label = nodes,
+      color = "royalblue"
+    ),
+    link = dict(
+      source = df_sankey['source'],
+      target = df_sankey['target'],
+      value = df_sankey['Tons'],
+      color = link_colors,
+      hovertemplate='Flow: %{value} tons from %{source.label} to %{target.label}<extra></extra>'
+    ))])
+
+fig.update_layout(
+    title_text="Supply Chain Flow: Origin to Districts (Sankey Diagram)", 
+    font_size=12,
+    template="plotly_white"
+)
+fig.show()
+```
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to see Plotly code for Warehouse Capacity Utilization
+
+# 1. Prepare data - ensuring the index name matches your AMPL set 'W'
+df_long = df_store_quarters.copy()
+df_long.index.name = 'W' 
+df_long = df_long.reset_index()
+
+# 2. Melt the dataframe using 'W' as the identifier
+df_long = df_long.melt(id_vars='W', var_name='Period', value_name='Tons')
+
+# 3. Create the Bar Chart
+fig = px.bar(
+    df_long, 
+    x="Period", 
+    y="Tons", 
+    color="W",
+    barmode="group",
+    title="End-of-Quarter Inventory vs. Storage Capacity",
+    labels={"Tons": "Inventory Level (Tons)", "Period": "Time (EOQ)", "W": "Warehouse"},
+    template="plotly_white",
+    # Using your specific set names for mapping
+    color_discrete_map={'Central': '#2ecc71', 'North': '#3498db', 'South': '#e67e22'}
+)
+
+# 4. Add the critical Capacity Limit line
+fig.add_hline(
+    y=70000, 
+    line_dash="dash", 
+    line_color="red", 
+    annotation_text="Central Capacity Limit (70k)", 
+    annotation_position="top right"
+)
+
+# 5. Refine layout
+fig.update_layout(
+    yaxis_range=[0, 85000], 
+    hovermode="x unified",
+    legend_title_text="Location"
+)
+
+fig.show()
+```
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to see Plotly code for Boat-to-Route Assignments
+
+import plotly.io as pio
+
+# Force a generic renderer that usually works everywhere
+pio.renderers.default = "notebook_connected"
+
+# 1. Clean data using the pivot you confirmed works
+# We ensure the columns are strings and index is strings
+plot_data = pivot_df.copy()
+plot_data.columns = [str(c) for c in plot_data.columns]
+plot_data.index = [str(i) for i in plot_data.index]
+
+# 2. Use go.Heatmap for maximum compatibility
+fig = go.Figure(data=go.Heatmap(
+    z=plot_data.values,
+    x=plot_data.columns,
+    y=plot_data.index,
+    text=plot_data.values,
+    texttemplate="%{text}", # This forces the Route ID to show up
+    colorscale='Blues',
+    showscale=False,
+    xgap=3, # Adds a little space between boxes
+    ygap=3
+))
+
+fig.update_layout(
+    title="Fleet Deployment Schedule (Route Assignments)",
+    xaxis_title="Quarter",
+    yaxis_title="Vessel",
+    template="plotly_white",
+    width=700,
+    height=400
+)
+
+# 3. The "Manual" Show
+fig.show()
+```
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to see Boat-to-Destination Volume Plot
+# 1. Clean up the 'combined' dataframe for plotting
+df_plot = combined.copy()
+df_plot['Quarter'] = df_plot['Quarter'].astype(str).map({'1':'Q1', '2':'Q2', '3':'Q3', '4':'Q4'})
+
+# 2. Create the Stacked Bar Chart
+fig = px.bar(
+    df_plot, 
+    x="Boat", 
+    y="Tons", 
+    color="Destination",
+    facet_col="Quarter", # This creates 4 side-by-side graphs for each quarter
+    title="Fleet Workload: Tonnage Delivered per Boat and Destination",
+    labels={"Tons": "Volume (Tons)", "Boat": "Vessel"},
+    template="plotly_white",
+    category_orders={"Quarter": ["Q1", "Q2", "Q3", "Q4"]}
+)
+
+# 3. Polish the layout
+fig.update_layout(
+    barmode='stack',
+    hovermode="x unified",
+    showlegend=True,
+    legend_title_text='Delivery Point'
+)
+
+# Clean up facet titles (removes "Quarter=")
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+
+fig.show()
+```
+
+```{python}
+#| code-fold: true
+#| code-summary: Click to see Plotly code for Cost Breakdown
+from plotly.subplots import make_subplots
+
+# 1. Prepare data from your calculated variables
+categories = [
+    "Raw Materials", "Fixed Production", "Overtime", 
+    "Storage", "Warehouse Rent", "Boat Rental", "Penalties"
+]
+costs = [rm_costs, fixed_prod, ot_costs, storage_costs, rent_cost, total_boat_costs, penalties]
+
+# 2. Create a Dashboard with two plots side-by-side
+fig = make_subplots(
+    rows=1, cols=2, 
+    column_widths=[0.6, 0.4],
+    specs=[[{"type": "waterfall"}, {"type": "pie"}]],
+    subplot_titles=("Cost Accumulation (Waterfall)", "Cost Distribution (%)")
+)
+
+# 3. Add Waterfall Chart
+fig.add_trace(
+    go.Waterfall(
+        name="Costs",
+        orientation="v",
+        measure=["relative"] * len(categories) + ["total"],
+        x=categories + ["TOTAL COST"],
+        textposition="outside",
+        text=[f"{val/1e6:.1f}M" for val in costs] + [f"{total_cost/1e6:.1f}M"],
+        y=costs + [total_cost],
+        connector={"line": {"color": "rgb(63, 63, 63)"}},
+        increasing={"marker": {"color": "#e74c3c"}}, # Red for costs
+        totals={"marker": {"color": "#2c3e50"}}      # Dark blue for total
+    ),
+    row=1, col=1
+)
+
+# 4. Add Donut Chart
+fig.add_trace(
+    go.Pie(
+        labels=categories,
+        values=costs,
+        hole=.4,
+        marker=dict(colors=['#3498db', '#9b59b6', '#f1c40f', '#e67e22', '#1abc9c', '#34495e', '#95a5a6']),
+        textinfo='percent',
+        hoverinfo='label+value'
+    ),
+    row=1, col=2
+)
+
+# 5. Styling
+fig.update_layout(
+    title_text=f"Financial Overview: Total Yearly Cost Analysis ({total_cost/1e6:,.1f}M NOK)",
+    template="plotly_white",
+    showlegend=False,
+    height=500
+)
+
+fig.show()
+```
+
