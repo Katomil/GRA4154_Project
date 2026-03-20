@@ -262,7 +262,7 @@ demand_data = {
 df_demand = pd.DataFrame(demand_data, index=["D1", "D2", "D3", "D4", "D5"])
 # Send the whole DataFrame to AMPL
 ampl.param["demand"] = df_demand.stack() # .stack() converts it to the 2D index D, Q
-# Number of days per quarter as specified in the exam table [1]
+# Number of days per quarter as specified in the exam table 
 ampl.param["days"] = {1: 90, 2: 91, 3: 92, 4: 92}
 # Production Capacity and Raw Material Costs 
 ampl.param["prod_cap"] = {"North": 17000, "South": 15000}
@@ -284,7 +284,7 @@ boat_data = {
 df_boats = pd.DataFrame(boat_data, index=["Anna", "Belinda", "Carla", "Diana", "Emma", "Fiona", "Gunda", "Huldra"])
 
 
-# Assigning to the snake_case parameters [7]
+# Assigning to the snake_case parameters 
 ampl.param["boat_load"] = df_boats["load"]
 ampl.param["boat_yearly_cost"] = df_boats["cost"]
 
@@ -452,7 +452,6 @@ print(df_full_list.to_string())
 ```{python}
 df_supply = ampl.get_variable("DistrictSupply").get_values().to_pandas().reset_index()
 
-# The rest of your index mapping is correct for the 5-index leg-level structure
 # Indices: Boat (0), Route (1), Leg (2), District (3), Quarter (4)
 df_supply.columns = ['B', 'R', 'L', 'D', 'Q', 'Tons']
 
@@ -460,7 +459,7 @@ df_supply.columns = ['B', 'R', 'L', 'D', 'Q', 'Tons']
 orig_map = ampl.get_parameter("orig").get_values().to_dict()
 df_supply['W'] = df_supply.set_index(['R', 'L']).index.map(orig_map)
 
-# Now group by Warehouse, District, and Quarter
+# Group by Warehouse, District, and Quarter
 df_supply_total = df_supply.groupby(['W', 'D', 'Q'])['Tons'].sum().unstack(level='Q')
 
 print("Answer 5: Quarterly Shipments to Sales Districts (Tons):")
@@ -475,7 +474,7 @@ df_store_final = ampl.get_variable("Store").get_values().to_pandas().unstack(lev
 
 df_store_quarters = df_store_final.iloc[:, :]
 
-# 4. Rename for the presentation
+# Rename for the presentation
 df_store_quarters.columns = ["Initial", "Q1", "Q2", "Q3", "Q4"]
 
 print("\nAnswer 6: End-of-Quarter Storage Levels (Tons):")
@@ -519,7 +518,7 @@ print("-" * 99)
 # Create a mapping for pretty printing
 q_map = {1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4"}
 
-# Iterate through the actual integer values used in your AMPL set
+# Iterate through the actual integer values used in AMPL set
 for q_val in [1, 2, 3, 4]:
     print(f"\n--- {q_map[q_val]} ---")
     
@@ -553,7 +552,7 @@ dist_summary = dist_summary.rename(columns={'index3': 'Destination'})
 
 # 4. Process Warehouse Transfers
 # Index levels: Boat, Route, Leg, Quarter
-# We need to map (Route, Leg) to the 'dest' warehouse parameter
+# Need to map (Route, Leg) to the 'dest' warehouse parameter
 dest_map = ampl.get_parameter("dest").get_values().to_dict()
 wh_flat = wh_df.reset_index()
 wh_summary = wh_flat[wh_flat['Tons'] > 0.1].copy()
@@ -654,6 +653,8 @@ I would argue that better data and predictive analytics can substitute for expen
 ### Summary:
 Uncertainty creates a Cost Variance. A plan that is "optimal" on paper may become the most expensive option if it is too fragile to handle a storm or a demand spike. By incorporating safety stocks and scenario testing, we ensure that the total yearly cost remains stable and customer service is guaranteed, even when reality deviates from the forecast.
 
+Thank You Professor for assigning us such a fun and complex project, I really felt challenged and felt like I grew by solving it.
+
 # Visualization
 This is a section I am making as a bonus to show the coolness of this submission format
 
@@ -665,7 +666,7 @@ import plotly.io as pio
 pio.renderers.default = "notebook_connected"
 
 # 1. Prepare the data
-# We ensure the index is named 'P' (from your set) and then move it to a column
+# Ensure the index is named 'P' ( and then move it to a column )
 df_plot = df_shifts.copy()
 df_plot.index.name = 'P' 
 df_plot = df_plot.reset_index()
@@ -711,7 +712,7 @@ fig.show()
 
 import plotly.express as px
 
-# 1. Prepare the data from your existing df_full_list
+# 1. Prepare the data from existing df_full_list
 df_plot_transfer = df_full_list.reset_index()
 # Rename the value column for a cleaner legend
 df_plot_transfer = df_plot_transfer.rename(columns={'WarehouseTransfer.val': 'Tons'})
@@ -744,7 +745,7 @@ fig.add_annotation(
     showarrow=True,
     arrowhead=2,
     ax=0,
-    ay=-40  # This moves the text 40 pixels ABOVE the point
+    ay=-40  
 )
 
 fig.show()
@@ -766,7 +767,7 @@ df_sankey['source'] = df_sankey['W'].map(node_dict)
 df_sankey['target'] = df_sankey['D'].map(node_dict)
 
 # 4. Robust Color Mapping (prevents the ValueError)
-# We convert Q to string and strip spaces just in case
+# Convert Q to string and strip spaces just in case
 color_map = {
     'Q1': 'rgba(31, 119, 180, 0.4)', 
     'Q2': 'rgba(255, 127, 14, 0.4)', 
@@ -805,7 +806,7 @@ fig.show()
 #| code-fold: true
 #| code-summary: Click to see Plotly code for Warehouse Capacity Utilization
 
-# 1. Prepare data - ensuring the index name matches your AMPL set 'W'
+# 1. Prepare data - ensuring the index name matches AMPL set 'W'
 df_long = df_store_quarters.copy()
 df_long.index.name = 'W' 
 df_long = df_long.reset_index()
@@ -823,7 +824,6 @@ fig = px.bar(
     title="End-of-Quarter Inventory vs. Storage Capacity",
     labels={"Tons": "Inventory Level (Tons)", "Period": "Time (EOQ)", "W": "Warehouse"},
     template="plotly_white",
-    # Using your specific set names for mapping
     color_discrete_map={'Central': '#2ecc71', 'North': '#3498db', 'South': '#e67e22'}
 )
 
@@ -855,22 +855,42 @@ import plotly.io as pio
 # Force a generic renderer that usually works everywhere
 pio.renderers.default = "notebook_connected"
 
-# 1. Clean data using the pivot you confirmed works
-# We ensure the columns are strings and index is strings
+# Get the raw assignment data from AMPL
+active_routes = ampl.get_variable("Assign").get_values().to_pandas()
+df_heat = active_routes.reset_index()
+df_heat.columns = ['Boat', 'Route', 'Quarter', 'Active']
+
+# Filter only for active assignments (where value is ~1)
+df_heat = df_heat[df_heat['Active'] > 0.5]
+
+# Map Quarters to String Labels
+q_labels = {1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'}
+df_heat['Quarter_Label'] = df_heat['Quarter'].astype(int).map(q_labels)
+
+# Create the pivot table 
+pivot_df = df_heat.pivot(index='Boat', columns='Quarter_Label', values='Route')
+
+# Ensure all quarters are present in order and fill empty spots with 0
+pivot_df = pivot_df.reindex(columns=['Q1', 'Q2', 'Q3', 'Q4']).fillna(0)
+
+
 plot_data = pivot_df.copy()
 plot_data.columns = [str(c) for c in plot_data.columns]
 plot_data.index = [str(i) for i in plot_data.index]
 
-# 2. Use go.Heatmap for maximum compatibility
+# Clean up text display: replace 0 with empty string for a cleaner look
+text_values = plot_data.replace(0, "").values
+
+
 fig = go.Figure(data=go.Heatmap(
     z=plot_data.values,
     x=plot_data.columns,
     y=plot_data.index,
-    text=plot_data.values,
-    texttemplate="%{text}", # This forces the Route ID to show up
-    colorscale='Blues',
+    text=text_values,
+    texttemplate="%{text}", 
+    colorscale='Greens',
     showscale=False,
-    xgap=3, # Adds a little space between boxes
+    xgap=3, 
     ygap=3
 ))
 
@@ -883,7 +903,6 @@ fig.update_layout(
     height=400
 )
 
-# 3. The "Manual" Show
 fig.show()
 ```
 
@@ -926,7 +945,7 @@ fig.show()
 #| code-summary: Click to see Plotly code for Cost Breakdown
 from plotly.subplots import make_subplots
 
-# 1. Prepare data from your calculated variables
+# 1. Prepare data from calculated variables
 categories = [
     "Raw Materials", "Fixed Production", "Overtime", 
     "Storage", "Warehouse Rent", "Boat Rental", "Penalties"
